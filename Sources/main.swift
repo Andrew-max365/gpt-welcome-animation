@@ -2,8 +2,10 @@ import AppKit
 import CoreGraphics
 import QuartzCore
 import ServiceManagement
+import OSLog
 
 let helperBundleID = "io.github.andrew-max365.gpt-welcome-animation"
+let lifecycleLog = Logger(subsystem: helperBundleID, category: "lifecycle")
 
 struct MotionAssets {
     let letters: TracedPath
@@ -27,7 +29,7 @@ struct MotionAssets {
 @MainActor
 final class OverlayPlayback: NSObject {
     let pid: pid_t
-    let windowID: CGWindowID
+    private(set) var windowID: CGWindowID
     let panel: OverlayPanel
     let motion: MotionView
     private let report: (String) -> Void
@@ -35,6 +37,9 @@ final class OverlayPlayback: NSObject {
     private var display: CADisplayLink?
     private var watchdog: Timer?
     private var startTime: CFTimeInterval = 0
+    private var clock = PlaybackClock()
+    private var focusLostAt: CFTimeInterval?
+    private var windowLostAt: CFTimeInterval?
     private var portalReported = false
     private var closed = false
 
@@ -59,9 +64,10 @@ final class OverlayPlayback: NSObject {
 
     func start() {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { stop("not-frontmost"); return }
+        startTime = CACurrentMediaTime()
         panel.orderFrontRegardless()
         panel.displayIfNeeded()
-        startTime = CACurrentMediaTime()
+        guard !closed else { return }
         // Use the actual display refresh clock, not a free-running animation timer.
         let link = panel.displayLink(target: self, selector: #selector(frame(_:)))
         let rate = Float(max(1, min(60, panel.screen?.maximumFramesPerSecond ?? 60)))
@@ -75,7 +81,8 @@ final class OverlayPlayback: NSObject {
     }
 
     @objc private func frame(_ link: CADisplayLink) {
-        let elapsed = max(0, CACurrentMediaTime() - startTime)
+        guard focusLostAt == nil, windowLostAt == nil, panel.isVisible else { clock.pause(); return }
+        let elapsed = clock.tick(at: CACurrentMediaTime())
         if elapsed >= Double(MotionTiming.portalStart), !portalReported {
             portalReported = true
             report("PORTAL_OPEN frontmost=\(NSWorkspace.shared.frontmostApplication?.processIdentifier == pid)")
@@ -86,11 +93,53 @@ final class OverlayPlayback: NSObject {
     }
 
     @objc private func checkWindow(_ timer: Timer) {
-        if CACurrentMediaTime() - startTime > Double(MotionTiming.finish) + 0.35 { stop("animation-timeout"); return }
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { stop("target-no-longer-frontmost"); return }
-        guard let target = targetWindow(pid: pid, id: windowID) else { stop("target-no-longer-visible"); return }
+        refreshTarget()
+    }
+
+    func refreshTarget() {
+        guard !closed else { return }
+        let now = CACurrentMediaTime()
+        if now - startTime > 22 { stop("animation-timeout"); return }
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
+            if focusLostAt == nil {
+                focusLostAt = now
+                clock.pause()
+                panel.orderOut(nil)
+                report("OVERLAY_PAUSED reason=focus-change elapsed=\(String(format: "%.2f", clock.elapsed))")
+            }
+            if let lost = focusLostAt, now - lost > 0.85 { stop("target-no-longer-frontmost") }
+            return
+        }
+        if focusLostAt != nil { focusLostAt = nil; clock.pause(); report("OVERLAY_RESUMED reason=focus-returned") }
+
+        // Electron-style startup windows can be destroyed and replaced while the
+        // app PID remains unchanged. Follow the frontmost eligible GPT window.
+        guard let target = targetWindow(pid: pid) else {
+            if windowLostAt == nil {
+                windowLostAt = now
+                clock.pause()
+                report("OVERLAY_PAUSED reason=window-rebuilding elapsed=\(String(format: "%.2f", clock.elapsed))")
+            }
+            if let lost = windowLostAt {
+                // Keep a very brief same-app gap visually covered; don't cover a
+                // different application or a minimized window indefinitely.
+                if now - lost > 0.55, panel.isVisible { panel.orderOut(nil) }
+                if now - lost > 2.5 { stop("target-no-longer-visible") }
+            }
+            return
+        }
+        if windowLostAt != nil { windowLostAt = nil; clock.pause(); report("OVERLAY_RESUMED reason=window-returned") }
+        if target.id != windowID {
+            report("WINDOW_REBOUND old=\(windowID) new=\(target.id)")
+            windowID = target.id
+        }
         if target.rect != panel.frame {
             panel.setFrame(target.rect, display: false)
+            motion.needsDisplay = true
+        }
+        if !panel.isVisible {
+            clock.pause()
+            panel.orderFrontRegardless()
             motion.needsDisplay = true
         }
     }
@@ -101,7 +150,7 @@ final class OverlayPlayback: NSObject {
         display?.invalidate(); display = nil
         watchdog?.invalidate(); watchdog = nil
         panel.orderOut(nil); panel.close()
-        report("OVERLAY_CLOSED reason=\(reason)")
+        report("OVERLAY_CLOSED reason=\(reason) elapsed=\(String(format: "%.2f", clock.elapsed))")
         let finish = onFinish; onFinish = nil; finish?()
     }
 }
@@ -157,10 +206,12 @@ final class LaunchMonitor: NSObject {
     @objc private func activated(_ n: Notification) {
         guard let app = runningApp(n) else { return }
         guard app.bundleIdentifier == targetBundleID else {
-            cancelWaiting()
-            playback?.stop("switched-app")
+            // A transient startup focus event mustn't permanently consume the
+            // cold-launch animation. The watchdog hides it and applies a grace period.
+            playback?.refreshTarget()
             return
         }
+        playback?.refreshTarget()
         let now = CACurrentMediaTime(), pid = app.processIdentifier
         let recent = app.launchDate.map { Date().timeIntervalSince($0) < 6 } ?? false
         if gate.activated(pid, at: now, recentLaunch: recent, suppress: shouldSuppress(now)) {
@@ -200,7 +251,7 @@ final class LaunchMonitor: NSObject {
         let elapsed = CACurrentMediaTime() - next.started
         if elapsed > 8 { report("PLAYBACK_SKIPPED no-window"); cancelWaiting(); return }
         if workspace.frontmostApplication?.processIdentifier != next.pid {
-            if elapsed > 0.45 { cancelWaiting() }
+            if elapsed > 0.85 { cancelWaiting() }
             return
         }
         guard let target = targetWindow(pid: next.pid) else { return }
@@ -235,7 +286,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let args = CommandLine.arguments
     private var dialogOpen = false
     private func makeMonitor(_ assets: MotionAssets) -> LaunchMonitor {
-        LaunchMonitor(assets: assets, loginGrace: 4, enabled: { SMAppService.mainApp.status == .enabled }, report: args.contains("--verbose") ? { print($0); fflush(stdout) } : { _ in })
+        let verbose = args.contains("--verbose")
+        return LaunchMonitor(assets: assets, loginGrace: 4, enabled: { SMAppService.mainApp.status == .enabled }, report: { message in
+            // A handful of lifecycle messages per launch, managed by macOS; no local log file or screen data.
+            lifecycleLog.info("\(message, privacy: .public)")
+            if verbose { print(message); fflush(stdout) }
+        })
     }
 
     func applicationDidFinishLaunching(_ n: Notification) {

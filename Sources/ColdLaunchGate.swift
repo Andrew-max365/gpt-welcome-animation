@@ -1,5 +1,19 @@
 import Foundation
 
+// Advance displayed animation time, never jump across a stalled display callback.
+struct PlaybackClock {
+    private(set) var elapsed: TimeInterval = 0
+    private var last: TimeInterval?
+
+    mutating func pause() { last = nil }
+
+    mutating func tick(at now: TimeInterval) -> TimeInterval {
+        if let last { elapsed += min(1.0 / 30.0, max(0, now - last)) }
+        last = now
+        return elapsed
+    }
+}
+
 // A PID already seen by the monitor is never replayed on an ordinary activation.
 // The tiny grace window accounts for the unspecified ordering of the launch and
 // foreground-activation notifications. A background launch expires without playing.
@@ -64,6 +78,15 @@ func runGateTests() -> Bool {
     check(!gate.activated(106, at: 10, recentLaunch: true), "suppressed login restore remains a warm process")
     gate.terminated(101)
     check(gate.launched(101, at: 20, foreground: true), "after actual termination the next launch plays")
+    var clock = PlaybackClock()
+    check(clock.tick(at: 1) == 0, "first presented frame starts at zero")
+    _ = clock.tick(at: 1.016)
+    let beforeStall = clock.elapsed
+    _ = clock.tick(at: 2.5)
+    check(clock.elapsed - beforeStall <= 0.034, "a stalled display link cannot skip the animation")
+    clock.pause()
+    let paused = clock.elapsed
+    check(clock.tick(at: 5) == paused, "resuming a hidden overlay preserves displayed progress")
     print(failures == 0 ? "COLD_LAUNCH_TESTS=PASS" : "COLD_LAUNCH_TESTS=FAIL count=\(failures)")
     return failures == 0
 }
