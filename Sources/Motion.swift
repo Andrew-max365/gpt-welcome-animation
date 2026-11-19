@@ -1,8 +1,10 @@
 import AppKit
 import CoreGraphics
 import QuartzCore
+import OSLog
 
 let gptBundleID = "com.openai.codex"
+private let letteringLog = Logger(subsystem:"io.github.andrew-max365.gpt-welcome-animation",category:"lettering")
 let cs = CGColorSpace(name: CGColorSpace.sRGB)!
 func color(_ hex: UInt32, _ alpha: CGFloat = 1) -> CGColor {
     CGColor(srgbRed: CGFloat((hex >> 16) & 255) / 255, green: CGFloat((hex >> 8) & 255) / 255, blue: CGFloat(hex & 255) / 255, alpha: alpha)
@@ -199,6 +201,13 @@ final class MotionView: NSView {
     lazy var textPace=StrokePace(letters,sx:0.76,sy:0.89,turn:0.75,overlap:0.78)
     lazy var bridgePace=StrokePace(bridge,sx:1,sy:1,turn:0.22)
     lazy var logoPace=StrokePace(logo,sx:1,sy:1,turn:0.42)
+    // Only the handwriting is rasterized. Its bitmap is small, reusable, and
+    // rendered by a CPU bitmap context instead of the window's vector context.
+    private lazy var letteringBounds = letters.part(0,letters.length).boundingBoxOfPath.insetBy(dx:-22,dy:-22)
+    private var letteringSurface: CGContext?
+    private var letteringSurfaceRect = CGRect.zero
+    private var letteringSurfacePixels = CGSize.zero
+    private var letteringReportedFallback=false
     var t: CGFloat = 0
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { false }
@@ -214,6 +223,51 @@ final class MotionView: NSView {
         ctx.saveGState();ctx.setAlpha(alpha);ctx.setLineWidth(width);ctx.setLineCap(.round);ctx.setLineJoin(.round);ctx.addPath(path);ctx.replacePathWithStrokedPath();ctx.clip();ctx.drawLinearGradient(gradient,start:from,end:to,options:[.drawsBeforeStartLocation,.drawsAfterEndLocation])
         if texture>0.005 {ctx.setAlpha(alpha*texture);ctx.interpolationQuality = .none;ctx.draw(grain,in:CGRect(x:0,y:0,width:69,height:69),byTiling:true)}
         ctx.restoreGState()
+    }
+    private func paintLettering(_ ctx:CGContext,distance:CGFloat,alpha:CGFloat,activeAlpha:CGFloat) {
+        shaded(ctx,letters.part(0,distance),gradient:textGradient,from:CGPoint(x:153,y:0),to:CGPoint(x:1724,y:0),alpha:alpha)
+        if activeAlpha>0 {
+            solid(ctx,letters.part(max(0,distance-23),distance),width:4.2,fill:color(0xffffff),alpha:activeAlpha)
+        }
+    }
+    private func rasterizedLettering(_ target:CGContext,distance:CGFloat,alpha:CGFloat,activeAlpha:CGFloat) {
+        guard distance>0.01,alpha>0.001 else {return}
+        // Align the reusable surface to physical pixels. This avoids introducing
+        // a second fractional-pixel resampling step when compositing the image.
+        let deviceRect=target.convertToDeviceSpace(letteringBounds).standardized.integral
+        let mappedRect=target.convertToUserSpace(deviceRect).standardized
+        let aligned = !mappedRect.isNull && !mappedRect.isEmpty && deviceRect.width.isFinite && deviceRect.height.isFinite && deviceRect.width>=1 && deviceRect.height>=1 && deviceRect.width*deviceRect.height<=12_000_000
+        let rect=aligned ? mappedRect : letteringBounds
+        // Never fall back to the window's clip/stroke renderer. If a display
+        // transition temporarily doesn't offer a usable physical transform,
+        // use a smaller normalized bitmap until a valid mapping returns.
+        let w=aligned ? Int(deviceRect.width) : Int(ceil(rect.width*1.5))
+        let h=aligned ? Int(deviceRect.height) : Int(ceil(rect.height*1.5))
+        if !aligned && !letteringReportedFallback {letteringReportedFallback=true;letteringLog.info("LETTERING_BITMAP using normalized fallback")}
+        let pixels=CGSize(width:w,height:h)
+        if letteringSurface == nil || letteringSurfacePixels != pixels || abs(letteringSurfaceRect.minX-rect.minX)>0.00001 || abs(letteringSurfaceRect.minY-rect.minY)>0.00001 || abs(letteringSurfaceRect.width-rect.width)>0.00001 || abs(letteringSurfaceRect.height-rect.height)>0.00001 {
+            var actualW=w,actualH=h
+            letteringSurface=CGContext(data:nil,width:actualW,height:actualH,bitsPerComponent:8,bytesPerRow:0,space:cs,bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue)
+            if letteringSurface == nil {
+                actualW=max(1,w/2);actualH=max(1,h/2)
+                letteringSurface=CGContext(data:nil,width:actualW,height:actualH,bitsPerComponent:8,bytesPerRow:0,space:cs,bitmapInfo:CGImageAlphaInfo.premultipliedLast.rawValue)
+            }
+            letteringSurfacePixels=pixels;letteringSurfaceRect=rect
+            if let surface=letteringSurface {
+                surface.translateBy(x:0,y:CGFloat(actualH))
+                surface.scaleBy(x:CGFloat(actualW)/rect.width,y:-CGFloat(actualH)/rect.height)
+                surface.translateBy(x:-rect.minX,y:-rect.minY)
+                letteringLog.info("LETTERING_BITMAP \(actualW)x\(actualH) aligned=\(aligned)")
+            }
+        }
+        guard let surface=letteringSurface else {return}
+        surface.clear(rect)
+        paintLettering(surface,distance:distance,alpha:alpha,activeAlpha:activeAlpha)
+        guard let image=surface.makeImage() else {return}
+        target.saveGState();target.interpolationQuality = aligned ? .none : .high
+        target.translateBy(x:rect.minX,y:rect.maxY);target.scaleBy(x:1,y:-1)
+        target.draw(image,in:CGRect(x:0,y:0,width:rect.width,height:rect.height))
+        target.restoreGState()
     }
     func logoTransform(_ t:CGFloat,sceneScale:CGFloat)->(CGFloat,CGFloat,CGFloat,CGFloat) {
         let portal=progress(t,MotionTiming.portalStart,MotionTiming.portalEnd)
@@ -248,10 +302,8 @@ final class MotionView: NSView {
         let logoDist=logoPace.distance(velocityRamp(progress(t,bridgeEnd,logoEnd),initial:0.92,final:0.12,a:0.07,b:0.11))
         let decay=smooth(progress(t,writeEnd-0.02,bridgeEnd+0.38)),bridgeTail=bridge.length*smooth(progress(t,writeEnd+0.34,bridgeEnd+0.34))
         ctx.saveGState();ctx.translateBy(x:82,y:82);ctx.scaleBy(x:0.76,y:0.89)
-        shaded(ctx,letters.part(0,distance),gradient:textGradient,from:CGPoint(x:153,y:0),to:CGPoint(x:1724,y:0),alpha:1-decay)
-        if t>=MotionTiming.writeStart && t<writeEnd {
-            solid(ctx,letters.part(max(0,distance-23),distance),width:4.2,fill:color(0xffffff),alpha:0.11*smooth(progress(t,MotionTiming.writeStart,MotionTiming.writeStart+0.15))*(1-smooth(progress(t,writeEnd-0.13,writeEnd))))
-        }
+        let activeAlpha:CGFloat=t>=MotionTiming.writeStart && t<writeEnd ? 0.11*smooth(progress(t,MotionTiming.writeStart,MotionTiming.writeStart+0.15))*(1-smooth(progress(t,writeEnd-0.13,writeEnd))) : 0
+        rasterizedLettering(ctx,distance:distance,alpha:1-decay,activeAlpha:activeAlpha)
         ctx.restoreGState()
         shaded(ctx,bridge.part(min(bridgeDist,bridgeTail),bridgeDist),width:11,gradient:bridgeGradient,from:CGPoint(x:1392,y:545),to:CGPoint(x:883,y:583),alpha:1-smooth(progress(t,bridgeEnd+0.05,bridgeEnd+0.36)))
         ctx.saveGState();ctx.translateBy(x:cx,y:cy);ctx.scaleBy(x:sx,y:sy)
