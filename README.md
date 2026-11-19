@@ -12,6 +12,8 @@
 
 要求 macOS 14 或更新版本、已安装 ChatGPT 桌面客户端（`com.openai.codex`）、以及用于本次编译的 Apple Command Line Tools。没有 Homebrew、Node.js、Python 包、视频播放器或其他第三方运行依赖。
 
+Apple Silicon 的构建包也可在 [Releases](https://github.com/Andrew-max365/gpt-welcome-animation/releases) 下载。该包没有公证；如果 macOS 拦截，请采用下面的本地构建方式，**不要关闭系统安全保护**。
+
 ```sh
 git clone https://github.com/Andrew-max365/gpt-welcome-animation.git
 cd gpt-welcome-animation
